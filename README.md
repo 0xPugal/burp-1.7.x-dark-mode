@@ -22,4 +22,5 @@ If some area stays light or unreadable, open the **Dark Mode** tab → *Dump UI 
 
 ## Tests (no Burp needed; screenshots go to `tests/out`)
 
+    java -jar jython-standalone-2.7.4.jar tests/harness.py nimbus tests/out   # Burp 1.7 uses Nimbus
     java -jar jython-standalone-2.7.4.jar tests/harness.py metal tests/out

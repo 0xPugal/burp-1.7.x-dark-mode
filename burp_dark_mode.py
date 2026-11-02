@@ -39,10 +39,12 @@ from java.util import ArrayList, WeakHashMap
 from javax.swing import (JButton, JCheckBoxMenuItem, JColorChooser, JComponent, JLabel, JList,
                          JMenu, JPanel, JTable, JTree, SwingUtilities, Timer, UIManager)
 from javax.swing.border import CompoundBorder, LineBorder, TitledBorder
-from javax.swing.plaf import ColorUIResource
+from javax.swing.plaf import ColorUIResource, UIResource
 from javax.swing.plaf.basic import BasicTextUI, BasicTableUI
 from javax.swing.plaf.metal import DefaultMetalTheme, MetalLookAndFeel, OceanTheme
-from javax.swing.text import JTextComponent
+from javax.swing.plaf.nimbus import NimbusLookAndFeel
+from javax.swing.text import JTextComponent, StyleConstants, StyleContext
+from javax.swing import JTextPane
 from javax.swing import JTextField
 from javax.swing.tree import DefaultTreeCellRenderer
 
@@ -110,6 +112,17 @@ def xf_sel(c):
         return c
     return _make(h, max(s, 0.5), 0.5, c)
 
+
+# Nimbus derives most colours from these keys (Burp 1.7 runs on Nimbus).
+NIMBUS_DARK = {
+    "control": BG, "info": BG, "menu": BG,
+    "nimbusBase": Color(0x1b, 0x1d, 0x1f), "nimbusBlueGrey": Color(0x3a, 0x3d, 0x40),
+    "nimbusLightBackground": BG_TEXT, "text": FG, "textForeground": FG,
+    "nimbusSelectionBackground": SEL_BG, "nimbusSelection": SEL_BG,
+    "textBackground": SEL_BG, "textHighlight": SEL_BG,
+    "nimbusFocus": Color(0x4b, 0x6e, 0xaf), "nimbusDisabledText": FG_DISABLED,
+    "nimbusBorder": BORDER, "nimbusInfoBlue": Color(0x4b, 0x6e, 0xaf),
+}
 
 _XF = {"bg": xf_bg, "fg": xf_fg, "border": xf_border, "sel": xf_sel}
 
@@ -217,6 +230,8 @@ def _filter_class(base):
     try:
         if issubclass(base, BasicTextUI):
             class FilteredText(base):
+                _is_dark_filter = True
+
                 def installUI(self, c):
                     self._comp = c                    # getComponent() is protected: keep our own ref
                     self.super__installUI(c)
@@ -226,6 +241,8 @@ def _filter_class(base):
             cls = FilteredText
         elif issubclass(base, BasicTableUI):
             class FilteredTable(base):
+                _is_dark_filter = True
+
                 def paint(self, a, b):
                     if isinstance(a, Graphics):       # Synth also has paint(SynthContext, Graphics)
                         _filtered_paint(b, a, lambda g2: self.super__paint(g2, b))
@@ -334,6 +351,8 @@ class DarkModeController(object):
         self.saved = WeakHashMap()        # component -> snapshot (weak keys: no leaks)
         self.orig_defaults = {}           # L&F defaults key -> original value
         self.old_theme = None
+        self.nimbus_old = None            # user-table values we replaced (Nimbus)
+        self.light_colors = {}            # light defaults captured before switching
         self.listener = None
         self.errors = []
 
@@ -377,6 +396,7 @@ class DarkModeController(object):
             _collect(w, comps)
         for c in comps:                                 # 1. snapshot everything first
             self._snap(c)
+        self._capture_light()
         self._defaults_dark()                           # 2. dark colour defaults
         for c in comps:                                 # 3. refresh stock UIs / pixel filter
             self._stage(c, late=False)
@@ -403,15 +423,41 @@ class DarkModeController(object):
                 continue
             try:
                 if st.get("filtered"):
-                    c.setUI(st["ui"])
+                    c.updateUI()                        # fresh stock UI, colours from the light defaults
                 elif st.get("ui") is not None and not st.get("renderer") and _stock_ui(c):
                     c.updateUI()
             except Exception:
                 self._err("restore-ui " + c.__class__.__name__)
+        for c in comps:
+            st = self.saved.get(c)
+            if st is not None and "style_fg" in st:
+                ds, fg, had = st["style_fg"]
+                try:
+                    if had:
+                        StyleConstants.setForeground(ds, fg)
+                    else:
+                        ds.removeAttribute(StyleConstants.Foreground)
+                except Exception:
+                    self._err("style-fg")
         self.saved.clear()
+        leaked = []
+        for w in Window.getWindows():                   # safety net: never leave a filter UI behind
+            _collect(w, leaked)
+        for c in leaked:
+            try:
+                if getattr(c.getUI(), "_is_dark_filter", False):
+                    c.updateUI()
+            except Exception:
+                pass
 
     # -- L&F defaults --------------------------------------------------------
     def _defaults_dark(self):
+        if UIManager.getLookAndFeel().getName() == "Nimbus":
+            self.nimbus_old = {}
+            for k, v in NIMBUS_DARK.items():
+                self.nimbus_old[k] = UIManager.put(k, ColorUIResource(v))   # previous user-table value
+            UIManager.setLookAndFeel(NimbusLookAndFeel())                   # re-derive from the new keys
+            return
         d = UIManager.getLookAndFeelDefaults()
         new = {}
         if UIManager.getLookAndFeel().getName() == "Metal":
@@ -450,6 +496,13 @@ class DarkModeController(object):
             d.put(k, None)
 
     def _defaults_restore(self):
+        if self.nimbus_old is not None:
+            for k, old in self.nimbus_old.items():
+                UIManager.put(k, old)                   # None removes our key again
+            self.nimbus_old = None
+            UIManager.setLookAndFeel(NimbusLookAndFeel())
+            UIManager.setLookAndFeel(NimbusLookAndFeel())   # second pass: derived colours settle on the light parents
+            return
         d = UIManager.getLookAndFeelDefaults()
         for k, v in self.orig_defaults.items():
             d.put(k, None if v is _ABSENT else v)
@@ -460,15 +513,23 @@ class DarkModeController(object):
         elif UIManager.getLookAndFeel().getName() == "Metal":
             MetalLookAndFeel.setCurrentTheme(OceanTheme())
 
+    def _capture_light(self):
+        self.light_colors = {}
+        for prefix in ("TextArea", "TextPane", "EditorPane", "Table"):
+            for suffix in (".background", ".foreground", ".selectionBackground", ".selectionForeground",
+                           ".caretForeground", ".inactiveForeground", ".gridColor"):
+                c = UIManager.getColor(prefix + suffix)
+                if c is not None:
+                    self.light_colors[prefix + suffix] = self._plain(c)
+
     def _light_default(self, key):
-        v = self.orig_defaults.get(key)
-        return None if v is None or v is _ABSENT else v
+        return self.light_colors.get(key)
 
     # -- snapshot / restore --------------------------------------------------
     def _snap(self, c):
         if self.saved.containsKey(c):
             return self.saved.get(c)
-        st = {"extra": [], "tb": []}
+        st = {"extra": [], "tb": [], "frozen": {}}   # frozen: plain RGB copies (DerivedColor mutates)
         self.saved.put(c, st)
         try:
             if isinstance(c, DefaultTreeCellRenderer):
@@ -477,14 +538,23 @@ class DarkModeController(object):
                 bg, fg = c.getBackground(), c.getForeground()
                 if bg is not None:
                     st["bg"] = (c.isBackgroundSet(), bg)
+                    st["frozen"]["bg"] = self._plain(bg)
                 if fg is not None:
                     st["fg"] = (c.isForegroundSet(), fg)
+                    st["frozen"]["fg"] = self._plain(fg)
             for cls, props in _EXTRA:
                 if isinstance(c, cls):
                     for prop, kind, suffix in props:
                         old = getattr(c, "get" + prop)()
                         if old is not None:
                             st["extra"].append(("set" + prop, old, prop, suffix))
+                            st["frozen"][prop] = self._plain(old)
+            if isinstance(c, JTextPane):
+                # BasicTextPaneUI copies the component foreground into the document's default style
+                ds = c.getStyledDocument().getStyle(StyleContext.DEFAULT_STYLE)
+                if ds is not None:
+                    cur = ds.getAttribute(StyleConstants.Foreground)
+                    st["style_fg"] = (ds, None if cur is None else self._plain(cur), cur is not None)
             if isinstance(c, JComponent):
                 st["ui"] = c.getUI() if hasattr(c, "getUI") else None
                 b = c.getBorder()
@@ -496,22 +566,32 @@ class DarkModeController(object):
 
     def _snap_titles(self, b, st):
         if isinstance(b, TitledBorder):
-            st["tb"].append((b, b.getTitleColor(), b.getBorder()))
+            tc = b.getTitleColor()
+            st["tb"].append((b, tc, b.getBorder(), None if tc is None else self._plain(tc)))
             self._snap_titles(b.getBorder(), st)
         elif isinstance(b, CompoundBorder):
             self._snap_titles(b.getOutsideBorder(), st)
             self._snap_titles(b.getInsideBorder(), st)
 
+    @staticmethod
+    def _orig_color(orig, frozen):
+        """Theme colours (UIResource/DerivedColor) are mutated in place by the L&F, so restore their
+        frozen light RGB as a UIResource (updateUI() then re-installs the real one)."""
+        if isinstance(orig, UIResource) and frozen is not None:
+            return ColorUIResource(frozen)
+        return orig
+
     def _restore_props(self, c, st):
         try:
+            fz = st["frozen"]
             if "bg" in st:
-                c.setBackground(st["bg"][1] if st["bg"][0] else None)
+                c.setBackground(self._orig_color(st["bg"][1], fz.get("bg")) if st["bg"][0] else None)
             if "fg" in st:
-                c.setForeground(st["fg"][1] if st["fg"][0] else None)
+                c.setForeground(self._orig_color(st["fg"][1], fz.get("fg")) if st["fg"][0] else None)
             for setter, old, prop, suffix in st["extra"]:
-                getattr(c, setter)(old)
-            for b, tc, inner in st["tb"]:
-                b.setTitleColor(tc)
+                getattr(c, setter)(self._orig_color(old, fz.get(prop)))
+            for b, tc, inner, frozen in st["tb"]:
+                b.setTitleColor(None if tc is None else (self._plain(frozen) if frozen is not None else tc))
                 b.setBorder(inner)
             if st.get("border_changed"):
                 c.setBorder(st["border"])
@@ -536,29 +616,27 @@ class DarkModeController(object):
         except Exception:
             self._err("stage " + c.__class__.__name__)
 
+    @staticmethod
+    def _plain(col):
+        """Explicit (non-UIResource) copy: Synth/Nimbus never overwrites those with style colours."""
+        return Color(col.getRed(), col.getGreen(), col.getBlue(), col.getAlpha())
+
     def _relight(self, c, st, late):
-        """A filtered component must keep its original *light* colours: the filter darkens them."""
-        if not late:
-            for key, getter, setter in (("bg", "getBackground", "setBackground"),
-                                        ("fg", "getForeground", "setForeground")):
-                if key in st:
-                    getattr(c, setter)(st[key][1] if st[key][0] else None)
-            for setter, old, prop, suffix in st["extra"]:
-                getattr(c, setter)(old)
-            return
-        # Created while dark: swap theme-default (UIResource) colours back to the light defaults.
+        """A filtered component must paint with its original *light* colours (the filter darkens
+        them), and they must be explicit so the dark L&F style can't reset them."""
         prefix = c.getUIClassID()[:-2]
-        for getter, setter, suffix in (("getBackground", "setBackground", ".background"),
-                                       ("getForeground", "setForeground", ".foreground")):
-            cur = getattr(c, getter)()
-            light = self._light_default(prefix + suffix)
-            if _is_res(cur) and light is not None:
-                getattr(c, setter)(light)
+        for key, getter, setter, suffix in (("bg", "getBackground", "setBackground", ".background"),
+                                            ("fg", "getForeground", "setForeground", ".foreground")):
+            if not late and key in st["frozen"]:
+                light = st["frozen"][key]
+            else:
+                light = self._light_default(prefix + suffix) or getattr(c, getter)()
+            if light is not None:
+                getattr(c, setter)(self._plain(light))
         for setter, old, prop, suffix in st["extra"]:
-            cur = getattr(c, "get" + prop)()
-            light = self._light_default(prefix + suffix) if suffix else None
-            if _is_res(cur) and light is not None:
-                getattr(c, setter)(light)
+            light = st["frozen"].get(prop) if not late else (self._light_default(prefix + suffix) if suffix else None) or old
+            if light is not None:
+                getattr(c, setter)(self._plain(light))
 
     # -- colour remapping ----------------------------------------------------
     def _apply(self, c):
