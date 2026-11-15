@@ -1,136 +1,250 @@
-# -*- coding: utf-8 -*-
-# Run: java -jar jython-standalone-2.7.4.jar tests/harness.py [metal|nimbus|system] OUTDIR
-# Builds a Burp-like window (styled text pane with hard-coded token colours, table, tree,
-# a tab strip with a custom non-stock UI), toggles dark mode and saves screenshots.
-# Also asserts that dark -> light restores the window pixel-for-pixel.
-import sys, os, time
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+﻿# -*- coding: utf-8 -*-
+"""
+Offline harness for burp_dark_mode.py (Jython 2.7, Java 8).
+
+It creates a Burp-like Swing window (Nimbus L&F, hard-coded cell renderers and
+a styled document), applies the dark theme, opens a new dialog, switches back
+to light and verifies that the window is restored pixel-for-pixel.
+
+Run (from the repository root):
+
+    java -cp jython-standalone-2.7.4.jar org.python.util.jython tests/harness.py tests/out
+
+Exit code 0 = all checks passed.
+"""
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, ".."))
+
 import burp_dark_mode as bdm
-from java.awt import BorderLayout, Color
-from java.lang import Runnable, System
-from javax.swing import (JFrame, JMenuBar, JMenu, JMenuItem, JTabbedPane, JPanel, JTextArea,
-                         JScrollPane, JTable, JButton, JSplitPane, JTree, JDialog, JLabel,
-                         JTextPane, SwingUtilities, UIManager)
-from javax.swing.border import TitledBorder, LineBorder
-from javax.swing.plaf.basic import BasicTabbedPaneUI
-from javax.swing.text import SimpleAttributeSet, StyleConstants
-from javax.swing.table import DefaultTableCellRenderer
+
+from java.awt import BorderLayout, Color, Dimension
 from java.awt.image import BufferedImage
-from javax.imageio import ImageIO
 from java.io import File
+from java.lang import Object, Runnable, System
+from javax.imageio import ImageIO
+from javax.swing import (JButton, JDialog, JFrame, JLabel, JPanel, JScrollPane, JTabbedPane,
+                         JTable, JTextArea, JTextPane, JTree, JSplitPane, SwingUtilities,
+                         UIManager)
+from javax.swing.table import DefaultTableCellRenderer
+from javax.swing.text import SimpleAttributeSet, StyleConstants
 
-laf = sys.argv[1] if len(sys.argv) > 1 else "metal"
-out = sys.argv[2] if len(sys.argv) > 2 else "."
-names = {"metal": "javax.swing.plaf.metal.MetalLookAndFeel",
-         "nimbus": "javax.swing.plaf.nimbus.NimbusLookAndFeel",
-         "system": UIManager.getSystemLookAndFeelClassName()}
-UIManager.setLookAndFeel(names[laf])
-
-
-class R(Runnable):
-    def __init__(s, f): s.f = f
-    def run(s): s.f()
+OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "out")
 
 
-def on_edt(f):
-    SwingUtilities.invokeAndWait(R(f))
+class _Run(Runnable):
+    def __init__(self, fn):
+        self.fn = fn
+
+    def run(self):
+        self.fn()
+
+
+def on_edt(fn):
+    SwingUtilities.invokeAndWait(_Run(fn))
+
+
+def wait(seconds=0.8):
+    time.sleep(seconds)
 
 
 class WhiteRenderer(DefaultTableCellRenderer):
-    """Like Burp's renderers: paints hard-coded colours regardless of the table's."""
-    def getTableCellRendererComponent(self, t, v, sel, foc, r, c):
-        comp = DefaultTableCellRenderer.getTableCellRendererComponent(self, t, v, sel, foc, r, c)
-        comp.setBackground(Color(255, 200, 150) if sel else Color.WHITE)
-        comp.setForeground(Color.BLACK)
-        return comp
+    """Simulates Burp's renderers, which paint fixed colours."""
 
-
-class CustomTabsUI(BasicTabbedPaneUI):
-    """Non-stock UI (module is not javax.swing.plaf): must be left alone and restored exactly."""
-    pass
+    def getTableCellRendererComponent(self, table, value, selected, focus, row, column):
+        component = DefaultTableCellRenderer.getTableCellRendererComponent(
+            self, table, value, selected, focus, row, column)
+        component.setBackground(Color(255, 200, 150) if selected else Color(255, 255, 255))
+        component.setForeground(Color(0, 0, 0))
+        return component
 
 
 state = {}
 
 
-def build():
-    f = JFrame("Burp Suite Professional v1.7.37 - test")
-    mb = JMenuBar(); m = JMenu("Burp"); m.add(JMenuItem("Save state")); mb.add(m); f.setJMenuBar(mb)
+def build_window():
+    frame = JFrame("Burp Suite Professional v1.7.37 - harness")
     tabs = JTabbedPane()
-    p = JPanel(BorderLayout())
-    p.setBorder(TitledBorder(LineBorder(Color.GRAY), "Request"))
-    pane = JTextPane()                                   # styled doc: plain text paints BLACK
-    doc = pane.getStyledDocument()
-    blue = SimpleAttributeSet(); StyleConstants.setForeground(blue, Color(0, 0, 255))
-    red = SimpleAttributeSet(); StyleConstants.setForeground(red, Color(255, 0, 0))
-    doc.insertString(0, "POST /login.aspx HTTP/1.1\nHost: example.com\nCookie: ", None)
-    doc.insertString(doc.getLength(), "ASP.NET_SessionId", blue)
-    doc.insertString(doc.getLength(), "=abc123\n\ntbUsername=", None)
-    doc.insertString(doc.getLength(), "admin", red)
-    pane.setEditable(True)
-    p.add(JScrollPane(pane), BorderLayout.CENTER)
-    tbl = JTable([["1", "GET", "/"], ["2", "POST", "/login"]], ["#", "Method", "URL"])
-    tbl.setDefaultRenderer(tbl.getColumnClass(0), WhiteRenderer())
-    tbl.setRowSelectionInterval(1, 1)
-    orange = JButton("Go"); orange.setBackground(Color(0xe8, 0x6a, 0x10))
-    p.add(orange, BorderLayout.SOUTH)
-    sp = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(tbl), p); sp.setDividerLocation(110)
-    tabs.addTab("Proxy", sp)
-    tabs.addTab("Tree", JScrollPane(JTree()))
+
+    panel = JPanel(BorderLayout())
+    table = JTable([["1", "GET", "/"], ["2", "POST", "/login"]], ["#", "Method", "URL"])
+    table.setDefaultRenderer(Object, WhiteRenderer())
+    table.setRowSelectionInterval(1, 1)
+
+    pane = JTextPane()
+    document = pane.getStyledDocument()
+    blue = SimpleAttributeSet()
+    StyleConstants.setForeground(blue, Color(0, 0, 192))
+    red = SimpleAttributeSet()
+    StyleConstants.setForeground(red, Color(160, 16, 16))
+    document.insertString(0, "POST /login HTTP/1.1\nHost: example.com\nCookie: ", None)
+    document.insertString(document.getLength(), "session=abc", blue)
+    document.insertString(document.getLength(), "\n\nuser=", None)
+    document.insertString(document.getLength(), "admin", red)
+
+    split = JSplitPane(JSplitPane.VERTICAL_SPLIT, JScrollPane(table), JScrollPane(pane))
+    split.setDividerLocation(120)
+    panel.add(split, BorderLayout.CENTER)
+    panel.add(JButton("Send"), BorderLayout.SOUTH)
+
+    tabs.addTab("Proxy", panel)
+    tabs.addTab("Target", JScrollPane(JTree()))
     tabs.addTab("Misc", JTextArea("plain text area"))
-    strip = JTabbedPane(); strip.setUI(CustomTabsUI()); strip.addTab("custom", JPanel())
-    f.add(strip, BorderLayout.NORTH)
-    f.add(tabs); f.setSize(700, 500); f.setLocation(100, 100); f.setVisible(True)
-    state["f"] = f
-on_edt(build)
+    frame.add(tabs)
+    frame.setSize(720, 500)
+    frame.setLocation(80, 80)
+    frame.setVisible(True)
+    state["frame"] = frame
 
 
-def snap():
-    time.sleep(1.0)
-    box = {}
-    def paint():
-        for key in ("f", "d"):
-            w = state.get(key)
-            if w is None or not w.isShowing():
-                continue
-            rp = w.getRootPane()
-            img = BufferedImage(rp.getWidth(), rp.getHeight(), BufferedImage.TYPE_INT_RGB)
-            g = img.createGraphics(); rp.paint(g); g.dispose()
-            box[key] = img
-    on_edt(paint)
-    return box
+def find_tabs(component):
+    if isinstance(component, JTabbedPane):
+        return component
+    if hasattr(component, "getComponents"):
+        for child in component.getComponents():
+            found = find_tabs(child)
+            if found is not None:
+                return found
+    return None
 
 
-def save(box, name):
-    for key, img in box.items():
-        ImageIO.write(img, "png", File(os.path.join(out, "%s_%s_%s.png" % (laf, name, key))))
+def focus_window():
+    frame = state["frame"]
+    frame.toFront()
+    frame.requestFocus()
+    tabs = find_tabs(frame)
+    if tabs is not None:
+        tabs.requestFocusInWindow()
+
+
+def capture(label):
+    frame = state["frame"]
+    root = frame.getRootPane()
+    image = BufferedImage(root.getWidth(), root.getHeight(), BufferedImage.TYPE_INT_RGB)
+    graphics = image.createGraphics()
+    root.paint(graphics)
+    graphics.dispose()
+    ImageIO.write(image, "png", File(os.path.join(OUT, "%s.png" % label)))
+    return image
+
+
+def open_dialog():
+    dialog = JDialog(state["frame"], "Harness dialog", False)
+    dialog.setLayout(BorderLayout(0, 6))
+    table = JTable([["a", "b"]], ["One", "Two"])
+    scroll = JScrollPane(table)
+    scroll.setPreferredSize(Dimension(320, 90))
+    dialog.add(scroll, BorderLayout.NORTH)
+    dialog.add(JScrollPane(JTextArea("Dialog opened while dark.")), BorderLayout.CENTER)
+    dialog.add(JLabel("  bottom"), BorderLayout.SOUTH)
+    dialog.setSize(340, 220)
+    dialog.setLocationRelativeTo(state["frame"])
+    dialog.setVisible(True)
+    state["dialog"] = dialog
+
+
+def capture_dialog(label):
+    dialog = state["dialog"]
+    root = dialog.getRootPane()
+    image = BufferedImage(root.getWidth(), root.getHeight(), BufferedImage.TYPE_INT_RGB)
+    graphics = image.createGraphics()
+    root.paint(graphics)
+    graphics.dispose()
+    ImageIO.write(image, "png", File(os.path.join(OUT, "%s.png" % label)))
 
 
 def diff(a, b):
-    n = 0
+    if a.getWidth() != b.getWidth() or a.getHeight() != b.getHeight():
+        return -1
+    count = 0
     for x in range(a.getWidth()):
         for y in range(a.getHeight()):
             if a.getRGB(x, y) != b.getRGB(x, y):
-                n += 1
-    return n
+                count += 1
+    return count
 
 
-ctl = bdm.DarkModeController()
-light = snap(); save(light, "1_light")
-ctl.set_enabled(True); time.sleep(0.8)
-print("errors after enable:", ctl.errors)
-dark = snap(); save(dark, "2_dark")
+def main():
+    if not os.path.isdir(OUT):
+        os.makedirs(OUT)
+
+    UIManager.setLookAndFeel("javax.swing.plaf.nimbus.NimbusLookAndFeel")
+    on_edt(build_window)
+    wait(1.0)
+
+    engine = bdm.ThemeEngine()
+    on_edt(focus_window)
+    wait(0.4)
+    light = capture("1_light")
+    on_edt(lambda: engine.set_enabled(True))
+    wait(1.2)
+    dark = capture("2_dark")
+    if engine.errors:
+        print("errors while enabling: %s" % engine.errors)
+
+    on_edt(open_dialog)
+    wait(2.0)
+    capture_dialog("3_dark_dialog")
+    on_edt(lambda: state["dialog"].dispose())
+    wait(0.5)
+
+    on_edt(lambda: engine.set_enabled(False))
+    wait(1.2)
+    on_edt(focus_window)
+    wait(0.4)
+    restored = capture("4_restored")
+    if engine.errors:
+        print("errors while disabling: %s" % engine.errors)
+
+    def info():
+        table = None
+        for component in state["frame"].getContentPane().getComponents():
+            pass
+        def walk(c):
+            if isinstance(c, JTable):
+                return c
+            if hasattr(c, "getComponents"):
+                for child in c.getComponents():
+                    found = walk(child)
+                    if found is not None:
+                        return found
+            return None
+        table = walk(state["frame"])
+        if table is not None:
+            print("table bg=%s sel=%s grid=%s op=%s renderer=%s" % (
+                table.getBackground(), table.getSelectionBackground(), table.getGridColor(),
+                table.isOpaque(), table.getDefaultRenderer(Object).__class__.__name__))
+        pane = walk_text(state["frame"])
+        if pane is not None:
+            print("text bg=%s fg=%s caret=%s" % (pane.getBackground(), pane.getForeground(),
+                                                 pane.getCaretColor()))
+        print("UIManager control=%s TextPane.background=%s Table.background=%s" % (
+            UIManager.get("control"), UIManager.get("TextPane.background"),
+            UIManager.get("Table.background")))
+    def walk_text(c):
+        if isinstance(c, JTextPane):
+            return c
+        if hasattr(c, "getComponents"):
+            for child in c.getComponents():
+                found = walk_text(child)
+                if found is not None:
+                    return found
+        return None
+    on_edt(info)
+
+    differing = diff(light, restored)
+    print("restored vs original: %d differing pixels" % differing)
+    print("active after revert: %s" % engine.active)
+
+    success = differing == 0 and not engine.active
+    print("RESULT: %s" % ("PASS" if success else "FAIL"))
+    System.exit(0 if success else 1)
 
 
-def dlg():
-    d = JDialog(state["f"], "New dialog"); d.add(JLabel("Hello dialog")); d.add(JButton("OK"), BorderLayout.SOUTH)
-    ta = JTextArea("late text area"); d.add(ta, BorderLayout.NORTH)
-    d.setSize(250, 140); d.setLocation(200, 200); d.setVisible(True); state["d"] = d
-on_edt(dlg); save(snap(), "3_dark_dialog")
-on_edt(lambda: state["d"].dispose())
-ctl.set_enabled(False); time.sleep(0.8)
-print("errors after disable:", ctl.errors)
-back = snap(); save(back, "4_restored")
-print("restored vs light: differing pixels =", diff(light["f"], back["f"]))
-print("saved entries:", ctl.saved.size(), "defaults left:", len(ctl.orig_defaults), "enabled:", ctl.enabled)
-System.exit(0)
+main()
+
+
+
