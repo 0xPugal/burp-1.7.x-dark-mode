@@ -99,7 +99,9 @@ theme it reliably, so this extension uses a layered approach:
    * sets caret, selection and disabled-text colours on text components,
    * wraps table/list/tree/combo cell renderers so renderers that paint fixed light colours are
      recoloured after they produce their component (Burp's sorting and formatting logic is left
-     untouched),
+     untouched), and keeps re-wrapping renderers that Burp installs lazily when data arrives,
+   * applies a dark stylesheet to HTML viewer documents (scanner advisories) so their text is
+     readable,
    * replaces Nimbus' gradient table-header renderer with a dark one that keeps the
      ascending/descending sort indicators,
    * installs dark checkbox/radio icons.
@@ -134,10 +136,10 @@ timers and menu on unload, and keeps only weak references to components so it do
 
 ## Known limitations
 
-* **Web/HTML rendering panes remain light.** Burp's *Render* view (and rendered HTML bodies)
-  uses an embedded browser (`lobobrowser`). Web content is deliberately left untouched —
-  inverting or recolouring it would break the rendering. HTTP message *editors* (Raw/Params/
-  Headers/Hex), tables, trees and all native Swing UI are themed.
+* **Burp's *Render* view remains light.** Web pages displayed by Burp's embedded browser
+  (`lobobrowser`) are deliberately left untouched - recolouring arbitrary web content would break
+  the rendering. HTTP message editors (Raw/Params/Headers/Hex), tables, trees, scanner advisories,
+  dialogs and all native Swing UI are themed.
 * **OS window decorations are not themed.** The window title bar / borders are drawn by the
   operating system. On Windows 10/11 dark mode, they already match; otherwise enable the OS-wide
   dark title bar setting.

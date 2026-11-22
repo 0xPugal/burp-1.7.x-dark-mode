@@ -746,6 +746,7 @@ class ThemeEngine(object):
         self._hierarchy_listener = None
         self._late_timer = None
         self._dark_defaults = None
+        self._tracked = WeakHashMap()     # tables/trees/lists whose renderers we wrap
         self._internals = BurpInternals(self.mapper, self.log, self.error)
         self._selftest_sink = None
         self.late_enabled = True
@@ -904,6 +905,7 @@ class ThemeEngine(object):
         self._restore_look_and_feel()
         self._restore_renderers()
         self._snap.clear()
+        self._tracked.clear()
         self._themed_windows = []
         self._dark_defaults = None
 
@@ -1251,6 +1253,14 @@ class ThemeEngine(object):
                     # feel switch, otherwise updateUI() replaces them first.
                     classes = [Object, String, Number, Boolean, java_util_Date(),
                                javax_swing_ImageIcon()]
+                    try:
+                        for index in range(component.getColumnCount()):
+                            try:
+                                classes.append(component.getColumnClass(index))
+                            except (Exception, Throwable):
+                                pass
+                    except (Exception, Throwable):
+                        pass
                     for cls in classes:
                         if cls is None:
                             continue
@@ -1338,15 +1348,18 @@ class ThemeEngine(object):
 
         # ---- tables -------------------------------------------------------
         if isinstance(component, JTable):
+            self._tracked.put(component, True)
             self._theme_table(component, state)
             return
 
         # ---- trees / lists ------------------------------------------------
         if isinstance(component, JTree):
+            self._tracked.put(component, True)
             self._set_bg_fg(component, state, p.bg_input, p.fg)
             self._theme_tree_renderer(component, state)
             return
         if isinstance(component, JList):
+            self._tracked.put(component, True)
             self._set_bg_fg(component, state, p.bg_input, p.fg)
             component.setSelectionBackground(p.sel_bg)
             component.setSelectionForeground(p.sel_fg)
@@ -1374,6 +1387,9 @@ class ThemeEngine(object):
             except (Exception, Throwable):
                 pass
             self._theme_document(component, state)
+            self._theme_html(component, state)
+            if state['text'].get('html') is True:
+                self._tracked.put(component, True)
             return
 
         # ---- menus / tooltips: Metal handles them -------------------------
@@ -1561,6 +1577,57 @@ class ThemeEngine(object):
         except (Exception, Throwable):
             state["text"]["doc"] = "error"
 
+    def _theme_html(self, component, state):
+        """Burp's advisory/browser panes render HTML with their own (dark) text
+        colours.  Add dark CSS rules to the document's stylesheet so the text is
+        readable; the rules are overridden with light ones when reverting."""
+        if "html" in state["text"]:
+            return
+        try:
+            if not hasattr(component, "getContentType"):
+                return
+            if component.getContentType() != "text/html":
+                return
+            document = component.getDocument()
+            if not hasattr(document, "getStyleSheet"):
+                return
+            sheet = document.getStyleSheet()
+            if sheet is None:
+                return
+            self._add_html_dark_rules(sheet)
+            state["text"]["html"] = True
+            state["text"]["html_doc"] = document
+        except (Exception, Throwable):
+            state["text"]["html"] = "error"
+
+    def _add_html_dark_rules(self, sheet):
+        p = self.palette
+        sheet.addRule("body { color: %s; background-color: %s; }" % (
+            to_hex(p.fg), to_hex(p.bg_input)))
+        for selector in ("p", "li", "td", "th", "div", "span", "pre", "blockquote",
+                         "b", "strong", "i", "em", "h1", "h2", "h3", "h4"):
+            sheet.addRule("%s { color: %s; }" % (selector, to_hex(p.fg)))
+        sheet.addRule("a { color: %s; }" % to_hex(p.accent))
+        sheet.addRule("hr { color: %s; }" % to_hex(p.border))
+
+    def _refresh_html(self, component, state):
+        """Re-apply the dark HTML rules if Burp replaced the document."""
+        try:
+            if state['text'].get('html') is not True:
+                return
+            document = component.getDocument()
+            if document is state['text'].get('html_doc'):
+                return
+            if not hasattr(document, "getStyleSheet"):
+                return
+            sheet = document.getStyleSheet()
+            if sheet is None:
+                return
+            self._add_html_dark_rules(sheet)
+            state["text"]["html_doc"] = document
+        except (Exception, Throwable):
+            pass
+
     # -- hooks --------------------------------------------------------------
     def _install_hooks(self):
         if self._hierarchy_listener is None:
@@ -1591,18 +1658,159 @@ class ThemeEngine(object):
             self._late_timer = None
 
     def _late_tick(self):
-        if not self.active or not self.late_enabled:
+        if not self.active:
             return
         try:
-            for window in self._visible_windows():
-                if window not in self._themed_windows:
-                    self._themed_windows.append(window)
-                    self._snapshot_tree(window)
-                    SwingUtilities.updateComponentTreeUI(window)
-                    self._theme_tree(window)
-                    self._validate(window)
+            if self.late_enabled:
+                for window in self._visible_windows():
+                    if window not in self._themed_windows:
+                        self._themed_windows.append(window)
+                        self._snapshot_tree(window)
+                        SwingUtilities.updateComponentTreeUI(window)
+                        self._theme_tree(window)
+                        self._validate(window)
+            self._maintain_renderers()
         except (Exception, Throwable):
             self._error("late window")
+
+    # -- renderer maintenance ----------------------------------------------
+    def _maintain_renderers(self):
+        """Burp installs many cell renderers lazily (when rows arrive) and can
+        replace them later.  Re-wrap anything that is no longer ours."""
+        for component in ArrayList(self._tracked.keySet()):
+            state = self._snap.get(component)
+            if state is None:
+                continue
+            try:
+                if isinstance(component, JTable):
+                    self._refresh_table_renderers(component, state)
+                elif isinstance(component, JTree):
+                    self._refresh_tree_renderer(component, state)
+                elif isinstance(component, JList):
+                    self._refresh_list_renderer(component, state)
+                elif isinstance(component, JTextComponent):
+                    self._refresh_html(component, state)
+            except (Exception, Throwable):
+                self._error("refresh renderers")
+
+    def _record_renderer(self, state, kind, key, original):
+        entries = state.setdefault("renderers", [])
+        for index, entry in enumerate(entries):
+            if entry[0] == kind and entry[1] == key:
+                entries[index] = (kind, key, original)
+                return
+        entries.append((kind, key, original))
+
+    def _refresh_table_renderers(self, table, state):
+        palette = self.palette
+        try:
+            if table.getBackground() is None or luminance(table.getBackground()) > 0.45:
+                table.setBackground(palette.bg_input)
+            if table.getForeground() is None or luminance(table.getForeground()) < 0.45:
+                table.setForeground(palette.fg)
+            table.setGridColor(palette.border)
+            table.setSelectionBackground(palette.sel_bg)
+            table.setSelectionForeground(palette.sel_fg)
+        except (Exception, Throwable):
+            pass
+
+        classes = [Object, String, Number, Boolean, java_util_Date(), javax_swing_ImageIcon()]
+        try:
+            for index in range(table.getColumnCount()):
+                try:
+                    classes.append(table.getColumnClass(index))
+                except (Exception, Throwable):
+                    pass
+        except (Exception, Throwable):
+            pass
+        for cls in classes:
+            if cls is None:
+                continue
+            try:
+                current = table.getDefaultRenderer(cls)
+                if current is None or isinstance(current, RendererWrapper):
+                    continue
+                table.setDefaultRenderer(cls, RendererWrapper(current, self))
+                self._record_renderer(state, "default", cls, current)
+            except (Exception, Throwable):
+                pass
+
+        try:
+            columns = table.getColumnModel()
+            for index in range(columns.getColumnCount()):
+                column = columns.getColumn(index)
+                try:
+                    current = column.getCellRenderer()
+                    if current is not None and not isinstance(current, RendererWrapper):
+                        column.setCellRenderer(RendererWrapper(current, self))
+                        self._record_renderer(state, "column", index, current)
+                except (Exception, Throwable):
+                    pass
+                try:
+                    current = column.getHeaderRenderer()
+                    if current is not None and not isinstance(current, RendererWrapper):
+                        column.setHeaderRenderer(RendererWrapper(current, self))
+                        self._record_renderer(state, "header", index, current)
+                except (Exception, Throwable):
+                    pass
+        except (Exception, Throwable):
+            pass
+
+        header = table.getTableHeader()
+        if header is not None:
+            try:
+                if header.getBackground() is None or luminance(header.getBackground()) > 0.45:
+                    header.setBackground(palette.bg_panel)
+                if header.getForeground() is None or luminance(header.getForeground()) < 0.45:
+                    header.setForeground(palette.fg)
+                current = header.getDefaultRenderer()
+                if not isinstance(current, DarkHeaderRenderer):
+                    state["table"]["header_renderer"] = current
+                    header.setDefaultRenderer(DarkHeaderRenderer(self))
+            except (Exception, Throwable):
+                pass
+
+    def _refresh_tree_renderer(self, tree, state):
+        try:
+            current = tree.getCellRenderer()
+            if current is None or isinstance(current, TreeRendererWrapper):
+                return
+            tree.setCellRenderer(TreeRendererWrapper(current, self))
+            if state.get("trees"):
+                state["trees"][0] = current
+            else:
+                state["trees"] = [current]
+            if isinstance(current, DefaultTreeCellRenderer):
+                if not state.get("tree_props"):
+                    state["tree_props"] = {
+                        "bg": current.getBackgroundNonSelectionColor(),
+                        "bg_sel": current.getBackgroundSelectionColor(),
+                        "fg": current.getTextNonSelectionColor(),
+                        "fg_sel": current.getTextSelectionColor(),
+                        "border": current.getBorderSelectionColor(),
+                    }
+                current.setBackgroundNonSelectionColor(self.palette.bg_input)
+                current.setBackgroundSelectionColor(self.palette.sel_bg)
+                current.setTextNonSelectionColor(self.palette.fg)
+                current.setTextSelectionColor(self.palette.sel_fg)
+                current.setBorderSelectionColor(self.palette.sel_bg)
+            tree.repaint()
+        except (Exception, Throwable):
+            pass
+
+    def _refresh_list_renderer(self, listbox, state):
+        try:
+            current = listbox.getCellRenderer()
+            if current is None or isinstance(current, ListRendererWrapper):
+                return
+            listbox.setCellRenderer(ListRendererWrapper(current, self))
+            if state.get("lists"):
+                state["lists"][0] = current
+            else:
+                state["lists"] = [current]
+            listbox.repaint()
+        except (Exception, Throwable):
+            pass
 
     @staticmethod
     def _validate(component):
@@ -1749,6 +1957,21 @@ class ThemeEngine(object):
                                 StyleConstants.setForeground(style, state["text"]["doc"])
                             else:
                                 style.removeAttribute(StyleConstants.Foreground)
+                        except (Exception, Throwable):
+                            pass
+                    if "html" in state["text"]:
+                        try:
+                            if state["text"]["html"]:
+                                document = component.getDocument()
+                                sheet = document.getStyleSheet()
+                                if sheet is not None:
+                                    sheet.addRule("body { color: #000000; background-color: #FFFFFF; }")
+                                    for selector in ("p", "li", "td", "th", "div", "span", "pre",
+                                                     "blockquote", "b", "strong", "i", "em",
+                                                     "h1", "h2", "h3", "h4"):
+                                        sheet.addRule("%s { color: #000000; }" % selector)
+                                    sheet.addRule("a { color: #0000EE; }")
+                                    sheet.addRule("hr { color: #808080; }")
                         except (Exception, Throwable):
                             pass
 
@@ -3254,6 +3477,7 @@ class BurpExtender(IBurpExtender, IExtensionStateListener, ITab):
                 index += 1
             except (Exception, Throwable):
                 self._selftest_log("capture failed: " + traceback.format_exc())
+
 
 
 
